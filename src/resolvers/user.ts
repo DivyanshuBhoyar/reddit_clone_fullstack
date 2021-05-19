@@ -1,24 +1,23 @@
+import argon from "argon2";
 import { MyContext } from "src/types";
 import {
-  Resolver,
-  Mutation,
-  InputType,
-  Field,
   Arg,
   Ctx,
+  Field,
+  FieldResolver,
+  Mutation,
   ObjectType,
+  Query,
+  Resolver,
+  Root,
 } from "type-graphql";
+import { getConnection } from "typeorm";
+import { v4 } from "uuid";
+import { COOKIE_NAME, FORGET_PASSWORD_PREFIX } from "../constants";
 import { User } from "../entities/User";
-import argon from "argon2";
-import { EntityManager } from "@mikro-orm/postgresql";
-
-@InputType()
-class UserNamePasswordInput {
-  @Field()
-  username: string;
-  @Field()
-  password: string;
-} //another way to deal with Args() ; by predefining as a class
+import { sendEmail } from "../utils/sendEmail";
+import { validateRegister } from "../utils/validateRegister";
+import { UserNamePasswordInput } from "./UserNamePasswordInput";
 
 @ObjectType()
 class FieldError {
@@ -37,46 +36,124 @@ class UserResponse {
   user?: User;
 }
 
-@Resolver()
+@Resolver(User)
 export class UserResolver {
-  //register mutation
+  //forgot password
+
+  @FieldResolver(() => String)
+  email(@Root() user: User, @Ctx() { req }: MyContext) {
+    //this is the current user and its ok to show email
+    if (req.session.userId === user.id) return user.email;
+    //not okay to show someone else email
+    return "";
+  }
+
   @Mutation(() => UserResponse)
-  async register(
-    @Arg("options") options: UserNamePasswordInput, //type graphql automatically infers "options" type ??check
-    @Ctx() { em, req }: MyContext
+  async changePassword(
+    @Arg("token") token: string,
+    @Arg("newPassword") newPassword: string,
+    @Ctx() { redis, req }: MyContext
   ): Promise<UserResponse> {
-    if (options.username.length <= 2)
-      return {
-        errors: [
-          {
-            field: "username",
-            message: "username length",
-          },
-        ],
-      };
-    if (options.password.length <= 3)
+    if (newPassword.length <= 2) {
       return {
         errors: [
           {
             field: "password",
-            message: "password length",
+            message: "length must be greater than 2",
           },
         ],
       };
+    }
+    const key = FORGET_PASSWORD_PREFIX + token;
+    const userId = await redis.get(key);
+    if (!userId) {
+      return {
+        errors: [
+          {
+            field: "token",
+            message: "token expired",
+          },
+        ],
+      };
+    }
+    let userIdNum = parseInt(userId);
+    const user = await User.findOne(userIdNum);
+    if (!user) {
+      return {
+        errors: [
+          {
+            field: "token",
+            message: "user noe longer exists",
+          },
+        ],
+      };
+    }
+
+    await User.update(
+      { id: userIdNum },
+      {
+        password: await argon.hash(newPassword),
+      }
+    );
+    req.session.userId = user.id;
+    await redis.del(key);
+    return { user };
+  }
+
+  @Mutation(() => Boolean)
+  async forgotPassword(
+    @Arg("email") email: string,
+    @Ctx() { redis }: MyContext
+  ) {
+    const user = await User.findOne({ where: { email } });
+    if (!user) return true;
+
+    const token = v4();
+    await redis.set(
+      FORGET_PASSWORD_PREFIX + token,
+      user.id,
+      "ex",
+      1000 * 60 * 60 * 24 * 3
+    );
+
+    await sendEmail(
+      email,
+      `<a href="http://localhost:1234/change-password/${token}">Reset Password </a>`
+    );
+    return true;
+  }
+
+  @Query(() => User, { nullable: true })
+  me(@Ctx() { req }: MyContext) {
+    if (!req.session.userId) {
+      return null;
+    }
+    return User.findOne(req.session.userId);
+  }
+
+  //register mutation
+  @Mutation(() => UserResponse)
+  async register(
+    @Arg("options") options: UserNamePasswordInput, //type graphql automatically infers "options" type ??check
+    @Ctx() { req }: MyContext
+  ): Promise<UserResponse> {
+    const errors = validateRegister(options);
+    if (errors) return { errors };
     const hashedPassword = await argon.hash(options.password);
     let user;
     try {
-      const result = await (em as EntityManager)
-        .createQueryBuilder(User)
-        .getKnexQuery()
-        .insert({
+      const result = await getConnection()
+        .createQueryBuilder()
+        .insert()
+        .into(User)
+        .values({
           username: options.username,
+          email: options.email,
           password: hashedPassword,
-          created_at: new Date(),
-          updated_at: new Date(),
         })
-        .returning("*");
-      user = result[0];
+        .returning("*")
+        .execute();
+      user = result.raw[0];
     } catch (error) {
       console.log("err", error);
 
@@ -90,7 +167,6 @@ export class UserResolver {
           ],
         };
     }
-    console.log("user__", user);
     req.session.userId = user.id; //auto login after registration
     return { user };
   }
@@ -98,16 +174,23 @@ export class UserResolver {
   //login mutation
   @Mutation(() => UserResponse)
   async login(
-    @Arg("options") options: UserNamePasswordInput, //type graphql automatically infers "options" type ??check
-    @Ctx() { em, req }: MyContext
+    @Arg("usernameOrEmail") usernameOrEmail: string, //type graphql automatically infers "options" type ??check
+    @Arg("password") password: string, //type graphql automatically infers "options" type ??check
+    @Ctx() { req }: MyContext
   ): Promise<UserResponse> {
-    const user = await em.findOne(User, { username: options.username });
+    const user = await User.findOne(
+      usernameOrEmail.includes("@")
+        ? { where: { email: usernameOrEmail } }
+        : { where: { username: usernameOrEmail } }
+    );
     if (!user) {
       return {
-        errors: [{ field: "username", message: "that username doesnt exist" }],
+        errors: [
+          { field: "usernameOrEmail", message: "that username doesnt exist" },
+        ],
       };
     }
-    const valid = await argon.verify(user.password, options.password);
+    const valid = await argon.verify(user.password, password);
     if (!valid) {
       return {
         errors: [
@@ -122,5 +205,20 @@ export class UserResolver {
     console.log(req.session);
 
     return { user };
+  }
+  @Mutation(() => Boolean)
+  logout(@Ctx() { req, res }: MyContext) {
+    return new Promise((resolve) =>
+      req.session.destroy((err) => {
+        res.clearCookie(COOKIE_NAME);
+        if (err) {
+          console.log(err);
+
+          resolve(false);
+          return;
+        }
+        resolve(true);
+      })
+    );
   }
 }
